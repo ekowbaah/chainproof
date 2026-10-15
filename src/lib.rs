@@ -14,6 +14,9 @@ pub enum PolicyFinding {
     MissingProvenance,
     UnsignedArtifact,
     EmptySbom,
+    DisallowedLicense(String),
+    MutableActionReference(String),
+    ExcessiveWorkflowPermission(String),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SbomFormat {
@@ -82,6 +85,63 @@ pub fn evaluate_policy(
     }
     f
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenanceSummary {
+    pub predicate_type: String,
+    pub subject_names: Vec<String>,
+    pub builder_id: Option<String>,
+}
+pub fn inspect_provenance(input: &[u8]) -> Result<ProvenanceSummary, SbomError> {
+    let value: Value = serde_json::from_slice(input).map_err(|_| SbomError::InvalidJson)?;
+    let predicate_type = value
+        .get("predicateType")
+        .and_then(Value::as_str)
+        .ok_or(SbomError::UnsupportedFormat)?
+        .to_owned();
+    let subject_names = value
+        .get("subject")
+        .and_then(Value::as_array)
+        .ok_or(SbomError::MissingComponents)?
+        .iter()
+        .filter_map(|v| v.get("name")?.as_str().map(str::to_owned))
+        .collect();
+    let builder_id = value
+        .pointer("/predicate/builder/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(ProvenanceSummary {
+        predicate_type,
+        subject_names,
+        builder_id,
+    })
+}
+
+/// Finds common supply-chain hazards in GitHub Actions without needing a YAML engine.
+pub fn inspect_workflow(input: &str) -> Vec<PolicyFinding> {
+    let mut findings = Vec::new();
+    for line in input.lines().map(str::trim) {
+        if let Some(action) = line.strip_prefix("- uses:").map(str::trim) {
+            let reference = action.rsplit_once('@').map(|(_, r)| r).unwrap_or("");
+            let pinned = reference.len() == 40 && reference.bytes().all(|c| c.is_ascii_hexdigit());
+            if !pinned {
+                findings.push(PolicyFinding::MutableActionReference(action.to_owned()));
+            }
+        }
+        if matches!(
+            line,
+            "contents: write" | "actions: write" | "packages: write"
+        ) {
+            findings.push(PolicyFinding::ExcessiveWorkflowPermission(line.to_owned()));
+        }
+    }
+    findings
+}
+
+pub fn sarif(findings: &[PolicyFinding]) -> Value {
+    let results:Vec<Value>=findings.iter().enumerate().map(|(index,finding)|serde_json::json!({"ruleId":format!("chainproof/{index}"),"level":"error","message":{"text":format!("{finding:?}")}})).collect();
+    serde_json::json!({"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"chainproof"}},"results":results}]})
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +183,25 @@ mod tests {
         assert_eq!(
             inspect_sbom(br#"{"name":"x"}"#),
             Err(SbomError::UnsupportedFormat)
+        );
+    }
+    #[test]
+    fn reads_slsa_provenance_subjects() {
+        let p=inspect_provenance(br#"{"predicateType":"https://slsa.dev/provenance/v1","subject":[{"name":"image"}],"predicate":{"builder":{"id":"github"}}}"#).unwrap();
+        assert_eq!(p.subject_names, vec!["image"]);
+        assert_eq!(p.builder_id.as_deref(), Some("github"));
+    }
+    #[test]
+    fn flags_mutable_actions_and_write_permissions() {
+        let findings =
+            inspect_workflow("- uses: actions/checkout@v4\npermissions:\n  contents: write");
+        assert_eq!(findings.len(), 2);
+        assert_eq!(
+            sarif(&findings)["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
         );
     }
 }
