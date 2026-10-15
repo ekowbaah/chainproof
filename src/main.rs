@@ -1,7 +1,22 @@
-use chainproof::{digest, verify_file};
+use chainproof::{digest, inspect_sbom, verify_file};
 fn main() {
     let a: Vec<_> = std::env::args().collect();
     match a.as_slice() {
+        [_, command, path] if command == "sbom" => match std::fs::read(path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| inspect_sbom(&bytes).map_err(|error| format!("{error:?}")))
+        {
+            Ok(summary) => println!(
+                "format={:?} components={} name={}",
+                summary.format,
+                summary.component_count,
+                summary.document_name.as_deref().unwrap_or("unknown")
+            ),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1)
+            }
+        },
         [_, path] => match std::fs::read(path) {
             Ok(b) => println!("{}  {}", digest(&b), path),
             Err(e) => {
@@ -21,7 +36,7 @@ fn main() {
             }
         },
         _ => {
-            eprintln!("usage: chainproof <artifact> [expected-digest]");
+            eprintln!("usage: chainproof <artifact> [expected-sha256] | chainproof sbom <file>");
             std::process::exit(2)
         }
     }
